@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Định vị trong phòng bằng RSSI</title>
+<style>
+  :root { --bg:#f3f6f4; --panel:#fff; --ink:#14231c; --muted:#5d6f66; --line:#d5ded9; --target:#d6342c; --accent:#1d4ed8; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#101814; --panel:#17221c; --ink:#e6f0ea; --muted:#8fa399; --line:#2a3a31; --target:#ff6b5e; --accent:#7aa2ff; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:16px/1.5 "Segoe UI", system-ui, sans-serif; }
+  header { padding:20px 24px 8px; }
+  h1 { margin:0; font-size:22px; font-weight:650; }
+  #status { color:var(--muted); font-size:14px; }
+  #status.ok { color:#0f8a5f; }
+  main { display:grid; grid-template-columns:minmax(0,1.3fr) minmax(300px,1fr); gap:16px; padding:12px 24px 24px; }
+  @media (max-width:860px) { main { grid-template-columns:1fr; } }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; }
+  canvas { width:100%; display:block; }
+  .stack { display:flex; flex-direction:column; gap:16px; }
+  h2 { margin:0 0 8px; font-size:15px; font-weight:650; }
+  .pos { font-size:34px; font-weight:700; font-variant-numeric:tabular-nums; }
+  .hint { color:var(--muted); font-size:14px; }
+  .dev { border-top:1px solid var(--line); padding:12px 0; }
+  .dev:first-of-type { border-top:0; }
+  .dev-head { display:flex; justify-content:space-between; align-items:baseline; gap:8px; }
+  .dev-head b { display:flex; align-items:center; gap:8px; }
+  .dot { width:12px; height:12px; border-radius:50%; display:inline-block; }
+  .dev-d { font-size:22px; font-weight:700; font-variant-numeric:tabular-nums; }
+  .dev-m { color:var(--muted); font-size:14px; font-variant-numeric:tabular-nums; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:6px 12px; margin-top:6px; }
+  label { font-size:13px; color:var(--muted); }
+  input[type=number] { width:100%; padding:4px 6px; background:var(--panel); color:var(--ink); border:1px solid var(--line); border-radius:6px; }
+  input[type=range] { width:100%; }
+  .row2 { display:flex; gap:12px; }
+  .row2 label { flex:1; }
+  .cal { margin-top:10px; padding-top:8px; border-top:1px dashed var(--line); }
+  .cal .row2 { align-items:flex-end; }
+  button { font:inherit; font-size:14px; padding:6px 10px; border-radius:6px; border:1px solid var(--line);
+           background:var(--panel); color:var(--ink); cursor:pointer; }
+  button.main { background:var(--accent); color:#fff; border-color:var(--accent); }
+  :focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Định vị trong phòng bằng RSSI</h1>
+  <div id="status">Đang chờ dữ liệu từ các điện thoại…</div>
+</header>
+<main>
+  <section class="panel">
+    <canvas id="map" aria-label="Bản đồ phòng"></canvas>
+    <div class="hint" id="note"></div>
+  </section>
+  <div class="stack">
+    <section class="panel">
+      <h2>Vị trí ước tính của Target</h2>
+      <div class="pos" id="pos">–</div>
+      <div class="hint" id="posNote">Cần ít nhất 2 anchor gửi dữ liệu (3 anchor để ra 1 điểm duy nhất).</div>
+    </section>
+    <section class="panel">
+      <h2>Phòng và bộ lọc</h2>
+      <div class="row2">
+        <label>Rộng (m)<input id="roomW" type="number" min="1" step="0.5" value="10"></label>
+        <label>Dài (m)<input id="roomH" type="number" min="1" step="0.5" value="6"></label>
+      </div>
+      <label>Độ mượt khi đứng yên: <b id="wVal">4</b> (cao = ổn định hơn nhưng bám chậm khi di chuyển chậm)
+        <input id="W" type="range" min="1" max="10" value="4"></label>
+      <button id="resetCfg" style="margin-top:8px">Xóa cấu hình đã lưu</button>
+      <div class="hint">Lọc: trung vị, rồi trung bình cộng dồn khi đứng yên và tự bám lại khi Target di chuyển.</div>
+    </section>
+    <section class="panel">
+      <h2>Thiết bị đo (anchor)</h2>
+      <div id="devices" class="hint">Chưa có thiết bị nào gửi dữ liệu.</div>
+    </section>
+  </div>
+</main>
+
+<script>
+const COLORS = ["#0f6b4f", "#1d4ed8", "#b45309", "#7c3aed", "#0e7490"];
+// Vị trí mặc định của anchor theo kích thước phòng: 4 điểm 1/4 phòng (cho sai số thấp nhất trong mô phỏng), rồi giữa phòng
+function presetPos(i) {
+  const W = +$("roomW").value || 10, H = +$("roomH").value || 6;
+  return [[W * .25, H * .25], [W * .75, H * .25], [W * .75, H * .75], [W * .25, H * .75], [W / 2, H / 2]][i % 5];
+}
+const STALE_S = 5;
+
+const $ = id => document.getElementById(id);
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const label = id => id.replace(/^anchor(\d+)$/i, 'Anchor $1');
+const rssiToDist = (rssi, A, n) => Math.pow(10, (A - rssi) / (10 * n));
+
+const KEY = "rssi_cfg_v1";
+function loadCfg() { try { return JSON.parse(localStorage.getItem(KEY)) || {}; } catch (e) { return {}; } }
+const CFG = loadCfg();
+function saveCfg() {
+  try {
+    const c = { room: { w: $("roomW").value, h: $("roomH").value, s: $("W").value }, devs: {} };
+    for (const d of Object.values(S.devs)) c.devs[d.id] = { x: d.x, y: d.y, A: d.A, n: d.n };
+    localStorage.setItem(KEY, JSON.stringify(c));
+  } catch (e) { /* trình duyệt chặn lưu thì bỏ qua */ }
+}
+const S = { since: 0, rows: {}, devs: {}, lastRx: 0, total: 0, est: null, trail: [] };
+
+if (CFG.room) { $("roomW").value = CFG.room.w; $("roomH").value = CFG.room.h; $("W").value = CFG.room.s; $("wVal").textContent = CFG.room.s; }
+$("W").oninput = e => { $("wVal").textContent = e.target.value; saveCfg(); };
+$("roomW").oninput = $("roomH").oninput = saveCfg;
+$("resetCfg").onclick = () => { try { localStorage.removeItem(KEY); } catch (e) {} location.reload(); };
+
+function addDevice(id) {
+  const i = Object.keys(S.devs).length;
+  const d = S.devs[id] = { id, color: COLORS[i % COLORS.length], A: -45, n: 2.5,
+    x: presetPos(i)[0], y: presetPos(i)[1], dist: null, avg: null, raw: null, lastT: 0 };
+  const sv = (CFG.devs || {})[id]; if (sv) Object.assign(d, sv);   // khôi phục x, y, A, n đã lưu
+  S.rows[id] = [];
+  if (!i) $("devices").innerHTML = "";
+  const el = document.createElement("div");
+  el.className = "dev"; el.id = "dev-" + id;
+  el.innerHTML = `
+    <div class="dev-head"><b><span class="dot" style="background:${d.color}"></span>${label(id)}</b>
+      <span class="dev-d" data-k="d">–</span></div>
+    <div class="dev-m" data-k="m">–</div>
+    <div class="grid">
+      <label>Vị trí x (m)<input type="number" step="0.1" data-k="x" value="${d.x}"></label>
+      <label>Vị trí y (m)<input type="number" step="0.1" data-k="y" value="${d.y}"></label>
+      <label>A (RSSI ở 1 m): <b data-k="Av">${d.A}</b><input type="range" min="-80" max="-20" value="${d.A}" data-k="A"></label>
+      <label>n (suy hao): <b data-k="nv">${d.n}</b><input type="range" min="1.5" max="5" step="0.1" value="${d.n}" data-k="n"></label>
+    </div>
+    <div class="cal">
+      <div class="row2">
+        <label>Hiệu chỉnh: khoảng cách thật (m)<input type="number" step="0.1" min="0.1" data-k="calD" value="1"></label>
+        <button class="main" data-k="calAdd">Ghi mẫu</button>
+        <button data-k="calClr">Xóa</button>
+      </div>
+      <div class="hint" data-k="calInfo">Đứng yên đúng khoảng cách đó khoảng 10 giây rồi bấm Ghi mẫu. Ghi 2 đến 4 điểm (1 m, 2 m, 3 m...) để tự tính A và n.</div>
+    </div>`;
+  el.querySelectorAll("input").forEach(inp => inp.oninput = () => {
+    const k = inp.dataset.k; d[k] = parseFloat(inp.value);
+    if (k === "A") el.querySelector('[data-k="Av"]').textContent = d.A;
+    if (k === "n") el.querySelector('[data-k="nv"]').textContent = d.n;
+    saveCfg();
+  });
+  d.cal = []; d.calD = 1;
+  el.querySelector('[data-k="calAdd"]').onclick = () => calibrate(d, el, true);
+  el.querySelector('[data-k="calClr"]').onclick = () => { d.cal = []; calibrate(d, el, false); };
+  $("devices").appendChild(el);
+}
+
+async function poll() {
+  try {
+    const j = await (await fetch("/data?since=" + S.since)).json();
+    for (const r of j.rows) {
+      if (!S.devs[r.id]) addDevice(r.id);
+      const arr = S.rows[r.id]; arr.push(r);
+      if (arr.length > 300) arr.shift();
+      filterRssi(S.devs[r.id], arr);
+      S.devs[r.id].lastT = Date.now(); S.total++;
+      S.since = r.t;
+    }
+    if (j.rows.length) S.lastRx = Date.now();
+  } catch (e) {}
+  const alive = Date.now() - S.lastRx < 4000;
+  $("status").textContent = alive ? `Đang nhận dữ liệu từ ${Object.keys(S.devs).length} thiết bị (${S.total} mẫu)`
+    : (S.total ? "Mất tín hiệu, kiểm tra lại điện thoại" : "Đang chờ dữ liệu từ các điện thoại…");
+  $("status").className = alive ? "ok" : "";
+  update();
+}
+
+// Hiệu chỉnh tự động: RSSI = A - 10*n*log10(d). Đặt x = -10*log10(d) thì RSSI = A + n*x (đường thẳng).
+// 1 điểm: giữ nguyên n, tính lại A. Từ 2 điểm khác khoảng cách: hồi quy bình phương tối thiểu ra cả A và n.
+function calibrate(d, el, add) {
+  const info = el.querySelector('[data-k="calInfo"]');
+  if (add) {
+    if (d.kx === undefined || !d.live) { info.textContent = "Chưa có tín hiệu từ máy này, không ghi được."; return; }
+    const dist = d.calD;
+    if (!(dist > 0)) { info.textContent = "Nhập khoảng cách thật lớn hơn 0."; return; }
+    // lấy trung bình RSSI trong 10 giây gần nhất (bỏ 20% giá trị thấp nhất và cao nhất) cho ổn định
+    const arr = S.rows[d.id], tEnd = arr[arr.length - 1].t;
+    const win = arr.filter(r => r.t >= tEnd - 10).map(r => r.rssi).sort((p, q) => p - q);
+    if (win.length < 5) { info.textContent = `Mới có ${win.length} mẫu trong 10 giây gần nhất, đứng yên thêm rồi bấm lại.`; return; }
+    const cut = Math.floor(win.length * 0.2), core = win.slice(cut, win.length - cut);
+    d.cal.push({ dist, rssi: core.reduce((p, q) => p + q, 0) / core.length, count: win.length });
+  }
+  if (!d.cal.length) { info.textContent = "Chưa có mẫu nào."; return; }
+  const pts = d.cal.map(p => ({ x: -10 * Math.log10(p.dist), y: p.rssi }));
+  const mx = pts.reduce((a, p) => a + p.x, 0) / pts.length, my = pts.reduce((a, p) => a + p.y, 0) / pts.length;
+  const sxx = pts.reduce((a, p) => a + (p.x - mx) ** 2, 0), sxy = pts.reduce((a, p) => a + (p.x - mx) * (p.y - my), 0);
+  let n = d.n, A;
+  if (sxx > 1e-6) { n = Math.min(5, Math.max(1.5, sxy / sxx)); }
+  A = my - n * mx;
+  d.n = Math.round(n * 10) / 10;
+  d.A = Math.min(-20, Math.max(-80, Math.round(my - d.n * mx)));
+  el.querySelector('[data-k="A"]').value = d.A; el.querySelector('[data-k="Av"]').textContent = d.A;
+  el.querySelector('[data-k="n"]').value = d.n; el.querySelector('[data-k="nv"]').textContent = d.n;
+  saveCfg();
+  const list = d.cal.map(p => `${p.dist} m: ${p.rssi.toFixed(1)} dBm`).join(" | ");
+  info.textContent = `${d.cal.length} mẫu (${list}). Kết quả: A = ${d.A}, n = ${d.n}` +
+    (sxx > 1e-6 ? "." : " (chỉ 1 khoảng cách nên giữ n, thêm điểm ở khoảng cách khác để tính n).");
+}
+
+// Lọc mỗi mẫu mới: "khóa khi đứng yên".
+// - Trung vị vài mẫu để loại số nhảy đột biến.
+// - Đứng yên: lấy trung bình cộng dồn (càng nhiều mẫu càng chính xác, tới mức tối thiểu Kmin do thanh Độ mượt quyết định).
+// - Khi 2 mẫu liên tiếp lệch quá ngưỡng (người đang di chuyển): bỏ giá trị cũ, bám ngay mức mới rồi lại cộng dồn.
+// Kết quả: lúc di chuyển có thể lệch, nhưng đứng yên vài giây là hội tụ về giá trị chính xác nhất.
+function filterRssi(d, arr) {
+  const last = arr.slice(-6);
+  const span = last.length > 1 ? last[last.length - 1].t - last[0].t : 0;
+  const rate = span > 0 ? (last.length - 1) / span : 1;          // số mẫu mỗi giây của máy này
+  const fast = rate >= 3;                                        // máy gửi nhanh dùng cửa sổ trung vị lớn hơn
+  const MED = fast ? 5 : 3, Tm = fast ? 6 : 5;                   // Tm: ngưỡng coi là đang di chuyển (dBm)
+  const Kmin = 0.16 / +$("W").value;
+  const t = arr.slice(-MED).map(r => r.rssi).sort((p, q) => p - q);
+  const z = t[Math.floor(t.length / 2)];
+  if (d.kx === undefined) { d.kx = z; d.cnt = 1; d.mv = 0; return; }
+  const y = z - d.kx;
+  d.mv = Math.abs(y) > Tm ? d.mv + 1 : 0;
+  if (d.mv >= 2) {                                               // đang di chuyển: bám mức mới
+    d.kx = arr.slice(-3).reduce((p, r) => p + r.rssi, 0) / Math.min(3, arr.length);
+    d.cnt = 1; d.mv = 0; return;
+  }
+  d.cnt++;
+  d.kx += Math.max(1 / d.cnt, Kmin) * y;
+}
+
+function update() {
+  const live = [];
+  for (const d of Object.values(S.devs)) {
+    const arr = S.rows[d.id];
+    d.raw = arr[arr.length - 1].rssi;
+    d.avg = d.kx;
+    const dd = rssiToDist(d.avg, d.A, d.n);
+    d.dist = d.dist === null ? dd : d.dist + (dd - d.dist) * 0.5;
+    d.live = Date.now() - d.lastT < STALE_S * 1000;
+    const el = $("dev-" + d.id);
+    el.querySelector('[data-k="d"]').textContent = d.dist.toFixed(2) + " m";
+    el.querySelector('[data-k="m"]').textContent =
+      `RSSI ${d.raw} dBm, đã lọc ${d.avg.toFixed(1)} dBm` + (d.live ? "" : " (mất tín hiệu)");
+    if (d.live) live.push(d);
+  }
+  S.est = locate(live);
+  if (S.est) { S.trail.push(S.est); if (S.trail.length > 40) S.trail.shift(); }
+  const pn = $("posNote");
+  if (S.est) {
+    $("pos").textContent = `x = ${S.est.x.toFixed(2)} m, y = ${S.est.y.toFixed(2)} m`;
+    pn.textContent = live.length >= 3 ? `Trilateration bình phương tối thiểu với ${live.length} anchor.`
+      : "Mới có 2 anchor: hiển thị 2 điểm giao có thể, cần anchor thứ 3 để chọn.";
+  } else {
+    $("pos").textContent = "–";
+    pn.textContent = live.length === 1 ? "Mới có 1 anchor: chỉ biết khoảng cách, chưa biết hướng."
+      : "Cần ít nhất 2 anchor gửi dữ liệu (3 anchor để ra 1 điểm duy nhất).";
+  }
+  draw(live);
+}
+
+// Tinh chỉnh vị trí: cực tiểu hoá tổng (|p - anchor| - khoảng cách đo)^2 / d^2 bằng Gauss-Newton.
+// Trọng số 1/d^2 vì sai số RSSI tăng theo khoảng cách (anchor gần được tin hơn anchor xa).
+// Kẹp trong phòng vì Target chắc chắn nằm trong phòng.
+function refine(L, p0) {
+  const W = +$("roomW").value || 10, H = +$("roomH").value || 6;
+  const clamp = p => ({ x: Math.min(W, Math.max(0, p.x)), y: Math.min(H, Math.max(0, p.y)) });
+  let p = clamp(p0);
+  for (let it = 0; it < 15; it++) {
+    let a = 0, b = 0, c = 0, gx = 0, gy = 0;
+    for (const q of L) {
+      const dx = p.x - q.x, dy = p.y - q.y, r = Math.max(Math.hypot(dx, dy), 1e-3);
+      const w = 1 / Math.max(q.dist, 0.3) ** 2, jx = dx / r, jy = dy / r, res = r - q.dist;
+      a += w * jx * jx; b += w * jx * jy; c += w * jy * jy; gx += w * jx * res; gy += w * jy * res;
+    }
+    const lam = 1e-3 * (a + c) + 1e-6, A = a + lam, C = c + lam, det = A * C - b * b;
+    const sx = -(C * gx - b * gy) / det, sy = -(A * gy - b * gx) / det;
+    p = { x: p.x + sx, y: p.y + sy };
+    if (Math.hypot(sx, sy) < 1e-4) break;
+  }
+  return clamp(p);
+}
+
+// >=3 anchor: nghiệm tuyến tính rồi tinh chỉnh (refine). 2 anchor: trả về giao điểm gần tâm phòng hơn (kèm điểm còn lại)
+function locate(L) {
+  if (L.length >= 3) {
+    L = [...L].sort((p, q) => p.dist - q.dist);   // anchor gần nhất làm mốc (đo chính xác nhất)
+    const a = L[0]; let sxx = 0, sxy = 0, syy = 0, sbx = 0, sby = 0;
+    for (const b of L.slice(1)) {
+      const ax = 2 * (b.x - a.x), ay = 2 * (b.y - a.y);
+      const c = a.dist ** 2 - b.dist ** 2 + b.x ** 2 - a.x ** 2 + b.y ** 2 - a.y ** 2;
+      sxx += ax * ax; sxy += ax * ay; syy += ay * ay; sbx += ax * c; sby += ay * c;
+    }
+    const det = sxx * syy - sxy * sxy;
+    if (Math.abs(det) < 1e-6) return null;   // 3 anchor thẳng hàng
+    return refine(L, { x: (syy * sbx - sxy * sby) / det, y: (sxx * sby - sxy * sbx) / det });
+  }
+  if (L.length === 2) {
+    const [p, q] = L, dx = q.x - p.x, dy = q.y - p.y, D = Math.hypot(dx, dy);
+    if (D < 1e-6) return null;
+    const a = (p.dist ** 2 - q.dist ** 2 + D * D) / (2 * D), h2 = p.dist ** 2 - a * a;
+    const mx = p.x + a * dx / D, my = p.y + a * dy / D;
+    if (h2 < 0) return { x: mx, y: my, ambiguous: false };   // 2 vòng không cắt nhau: lấy điểm giữa
+    const h = Math.sqrt(h2), ox = -dy / D * h, oy = dx / D * h;
+    return { x: mx + ox, y: my + oy, alt: { x: mx - ox, y: my - oy }, ambiguous: true };
+  }
+  return null;
+}
+
+function draw(live) {
+  const cv = $("map"), W = Math.max(1, +$("roomW").value || 10), H = Math.max(1, +$("roomH").value || 6);
+  const dpr = window.devicePixelRatio || 1, cw = cv.parentElement.clientWidth - 32, pad = 28;
+  const sc = (cw - 2 * pad) / W, ch = H * sc + 2 * pad;
+  cv.style.height = ch + "px"; cv.width = cw * dpr; cv.height = ch * dpr;
+  const ctx = cv.getContext("2d"); ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const X = x => pad + x * sc, Y = y => pad + (H - y) * sc;   // y hướng lên trên
+  const line = css("--line"), muted = css("--muted"), ink = css("--ink");
+  ctx.font = "12px sans-serif";
+
+  ctx.strokeStyle = line; ctx.lineWidth = 1; ctx.fillStyle = muted; ctx.textAlign = "center";
+  for (let x = 0; x <= W; x++) { ctx.beginPath(); ctx.moveTo(X(x), Y(0)); ctx.lineTo(X(x), Y(H)); ctx.stroke(); ctx.fillText(x, X(x), Y(0) + 16); }
+  ctx.textAlign = "right";
+  for (let y = 0; y <= H; y++) { ctx.beginPath(); ctx.moveTo(X(0), Y(y)); ctx.lineTo(X(W), Y(y)); ctx.stroke(); ctx.fillText(y, X(0) - 6, Y(y) + 4); }
+  ctx.strokeStyle = ink; ctx.lineWidth = 2; ctx.strokeRect(X(0), Y(H), W * sc, H * sc);
+
+  ctx.save(); ctx.beginPath(); ctx.rect(X(0) - 20, Y(H) - 20, W * sc + 40, H * sc + 40); ctx.clip();
+  for (const d of live) {
+    ctx.beginPath(); ctx.arc(X(d.x), Y(d.y), d.dist * sc, 0, Math.PI * 2);
+    ctx.strokeStyle = d.color; ctx.lineWidth = 2; ctx.stroke(); ctx.fillStyle = d.color + "14"; ctx.fill();
+  }
+  ctx.restore();
+
+  for (const d of Object.values(S.devs)) {
+    ctx.beginPath(); ctx.arc(X(d.x), Y(d.y), 8, 0, Math.PI * 2);
+    ctx.fillStyle = d.live ? d.color : muted; ctx.fill();
+    ctx.fillStyle = ink; ctx.textAlign = "center"; ctx.fillText(label(d.id), X(d.x), Y(d.y) - 14);
+  }
+
+  const T = css("--target");
+  if (S.trail.length > 1 && !S.est?.ambiguous) {
+    ctx.beginPath(); ctx.strokeStyle = T + "88"; ctx.lineWidth = 2;
+    S.trail.forEach((p, i) => i ? ctx.lineTo(X(p.x), Y(p.y)) : ctx.moveTo(X(p.x), Y(p.y)));
+    ctx.stroke();
+  }
+  if (S.est) {
+    // đường nối iPhone -> từng anchor, ghi khoảng cách đo từ RSSI
+    for (const d of live) {
+      ctx.beginPath(); ctx.setLineDash([5, 4]); ctx.strokeStyle = d.color; ctx.lineWidth = 1.5;
+      ctx.moveTo(X(S.est.x), Y(S.est.y)); ctx.lineTo(X(d.x), Y(d.y)); ctx.stroke(); ctx.setLineDash([]);
+      const mx = (X(S.est.x) + X(d.x)) / 2, my = (Y(S.est.y) + Y(d.y)) / 2, txt = d.dist.toFixed(2) + " m";
+      ctx.font = "bold 12px sans-serif"; ctx.textAlign = "center";
+      const tw = ctx.measureText(txt).width + 8;
+      ctx.fillStyle = css("--panel"); ctx.fillRect(mx - tw / 2, my - 9, tw, 18);
+      ctx.fillStyle = d.color; ctx.fillText(txt, mx, my + 4); ctx.font = "12px sans-serif";
+    }
+    const pts = [S.est, S.est.alt].filter(Boolean);
+    pts.forEach((p, i) => {
+      ctx.beginPath(); ctx.arc(X(p.x), Y(p.y), i ? 7 : 10, 0, Math.PI * 2);
+      ctx.fillStyle = i ? T + "66" : T; ctx.fill();
+    });
+    ctx.fillStyle = ink; ctx.textAlign = "left";
+    ctx.fillText(S.est.ambiguous ? "Target (1 trong 2 điểm)" : "Target", X(S.est.x) + 14, Y(S.est.y) + 4);
+  }
+  $("note").textContent = "Đặt anchor ở đúng vị trí x, y (mét) rồi nhập vào bên phải. Gốc tọa độ là góc dưới trái của phòng.";
+}
+
+window.addEventListener("resize", () => update2());
+function update2() { if (Object.keys(S.devs).length) update(); else draw([]); }
+setInterval(poll, 250); poll(); draw([]);
+</script>
+</body>
+</html>
